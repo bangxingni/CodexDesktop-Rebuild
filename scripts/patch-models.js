@@ -117,6 +117,14 @@ function patchSource(source, serializedFallback) {
   const changes = [];
   let next = source;
 
+  next = replaceOnce(
+    next,
+    'availableModels:(e=>{let n=new Set(e);return ["gpt-5.6","gpt-5.6-sol","gpt-5.6-codex","gpt-5.6-mini"].forEach(e=>n.add(e)),n})(t.success?t.data:U)',
+    "availableModels:new Set(t.success?t.data:U)",
+    "remove legacy guessed GPT-5.6 whitelist",
+    changes,
+  );
+
   if (next.includes("supportedReasoningEfforts") && !next.includes("__codexGpt56Merge")) {
     const helper =
       `const __codexGpt56Fallback=${serializedFallback};` +
@@ -166,12 +174,12 @@ function patchSource(source, serializedFallback) {
     },
   );
 
-  next = replaceOnce(
-    next,
-    "threadSettings:{model:t,effort:n,multiAgentMode:ft}",
-    "threadSettings:{model:t,effort:n,reasoning_effort:n,multiAgentMode:ft}",
-    "pass manually selected reasoning effort to next turn",
-    changes,
+  next = next.replace(
+    /threadSettings:\{model:([A-Za-z_$][\w$]*),effort:([A-Za-z_$][\w$]*),multiAgentMode:([A-Za-z_$][\w$]*)\}/g,
+    (whole, model, effort, multiAgentMode) => {
+      changes.push("pass manually selected reasoning effort to next turn");
+      return `threadSettings:{model:${model},effort:${effort},reasoning_effort:${effort},multiAgentMode:${multiAgentMode}}`;
+    },
   );
 
   next = next.replace(
@@ -249,7 +257,14 @@ async function main() {
 
   for (const target of assetFiles(platform)) {
     const source = fs.readFileSync(target.path, "utf8");
-    if (!source.includes("supportedReasoningEfforts") && !source.includes("1186680773")) continue;
+    if (
+      !source.includes("supportedReasoningEfforts") &&
+      !source.includes("1186680773") &&
+      !source.includes("threadSettings:{model:") &&
+      !source.includes("set-default-model-config-for-host")
+    ) {
+      continue;
+    }
     const { code, changes } = patchSource(source, serializedFallback);
     if (changes.length === 0) continue;
     matched += 1;
