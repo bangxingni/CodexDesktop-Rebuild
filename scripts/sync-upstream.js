@@ -110,6 +110,24 @@ function clearDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
+function decodeMsixEscapedNames(dir) {
+  if (!fs.existsSync(dir)) return 0;
+
+  let count = 0;
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const current = path.join(dir, e.name);
+    if (e.isDirectory()) count += decodeMsixEscapedNames(current);
+
+    const decodedName = e.name.replace(/%40/g, "@");
+    if (decodedName !== e.name) {
+      const decoded = path.join(dir, decodedName);
+      fs.renameSync(current, decoded);
+      count++;
+    }
+  }
+  return count;
+}
+
 function countFiles(dir) {
   let n = 0;
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -117,6 +135,23 @@ function countFiles(dir) {
     else n++;
   }
   return n;
+}
+
+function getCachedWindowsX64Package() {
+  if (!fs.existsSync(TEMP_DIR)) return null;
+
+  const candidates = fs.readdirSync(TEMP_DIR)
+    .filter((name) => /^OpenAI\.Codex_\d+\.\d+\.\d+(?:\.\d+)?_x64__.*\.msix$/.test(name))
+    .map((name) => {
+      const fullPath = path.join(TEMP_DIR, name);
+      const stat = fs.statSync(fullPath);
+      const verMatch = name.match(/_(\d+\.\d+\.\d+(?:\.\d+)?)_/);
+      return { name, fullPath, mtimeMs: stat.mtimeMs, version: verMatch?.[1] || "unknown" };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  const cached = candidates[0];
+  return cached ? { version: cached.version, url: "", packageName: cached.name, cachedPath: cached.fullPath } : null;
 }
 
 // ─── Version detection ──────────────────────────────────────────
@@ -145,7 +180,8 @@ async function getWindowsVersion() {
   if (!info.categoryId) throw new Error("No CategoryID");
   const pkgs = await msstore.getFileList(cookie, info.categoryId, "Retail");
   if (pkgs.length === 0) throw new Error("No packages");
-  const pkg = pkgs[0];
+  const pkg = pkgs.find((p) => /_x64__/.test(p.name));
+  if (!pkg) throw new Error(`No Windows x64 package found; available: ${pkgs.map((p) => p.name).join(", ")}`);
   const url = await msstore.getDownloadUrl(pkg.updateID, pkg.revisionNumber, "Retail", pkg.digest);
   const verMatch = pkg.name.match(/_(\d+\.\d+\.\d+(?:\.\d+)?)_/);
   return { version: verMatch?.[1] || "unknown", url, packageName: pkg.name };
@@ -182,13 +218,13 @@ async function syncMac(variant, appcastUrl, destDir) {
 
 // ─── Extract Windows ────────────────────────────────────────────
 
-async function syncWin(destDir) {
+async function syncWin(destDir, detectedInfo) {
   console.log("\n-- Windows");
 
-  const info = await getWindowsVersion();
+  const info = detectedInfo || await getWindowsVersion();
   console.log(`   version: ${info.version}`);
 
-  const msixPath = path.join(TEMP_DIR, info.packageName || `codex-win-${info.version}.msix`);
+  const msixPath = info.cachedPath || path.join(TEMP_DIR, info.packageName || `codex-win-${info.version}.msix`);
   const extractDir = path.join(TEMP_DIR, "win-extract");
 
   if (!fs.existsSync(msixPath)) {
@@ -200,6 +236,8 @@ async function syncWin(destDir) {
   console.log("   [unzip]");
   clearDir(extractDir);
   extractArchive(msixPath, extractDir);
+  const decodedCount = decodeMsixEscapedNames(extractDir);
+  if (decodedCount > 0) console.log(`   [fix] decoded ${decodedCount} MSIX escaped paths`);
 
   const resourcesDir = path.join(extractDir, "app", "resources");
   if (!fs.existsSync(resourcesDir)) {
@@ -290,7 +328,16 @@ async function main() {
       const winInfo = await getWindowsVersion();
       console.log(`   win:       ${winInfo.version}`);
       results.win = winInfo;
-    } catch (e) { console.error(`   [x] win check: ${e.message}`); }
+    } catch (e) {
+      const cached = getCachedWindowsX64Package();
+      if (cached) {
+        console.error(`   [!] win check failed: ${e.message}`);
+        console.log(`   win:       ${cached.version} (cached x64)`);
+        results.win = cached;
+      } else {
+        console.error(`   [x] win check: ${e.message}`);
+      }
+    }
   }
 
   if (CHECK_ONLY) {
@@ -311,7 +358,7 @@ async function main() {
   }
   if (!SKIP_WIN && results.win) {
     try {
-      results.win = await syncWin(path.join(SRC_DIR, "win"));
+      results.win = await syncWin(path.join(SRC_DIR, "win"), results.win);
     } catch (e) { console.error(`   [x] win: ${e.message}`); }
   }
 
