@@ -362,10 +362,10 @@ function updateAsarIntegrity(asarPath, infoPlistPath) {
 // ─── Shared ─────────────────────────────────────────────────────
 
 function replaceCodex(platform, resourcesDir, binName) {
-  // The Windows MSIX already includes the matching current CLI. Replacing it
+  // Upstream desktop packages include a matching current CLI. Replacing it
   // with the npm package can downgrade model availability (for example 5.6).
-  if (platform === "win") {
-    console.log(`   [codex] keeping upstream Windows CLI`);
+  if (platform === "win" || platform.startsWith("mac-")) {
+    console.log(`   [codex] keeping upstream ${platform} CLI`);
     return;
   }
 
