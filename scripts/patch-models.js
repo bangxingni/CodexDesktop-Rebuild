@@ -5,13 +5,13 @@
  */
 const fs = require("fs");
 const https = require("https");
-const os = require("os");
 const path = require("path");
 const { relPath, SRC_DIR, PROJECT_ROOT } = require("./patch-util");
 
 const CATALOG_URL =
   "https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json";
 const GPT56_SLUGS = new Set(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
+const GPT56_MODELS = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 const ALL_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
 
 function fetchJson(url) {
@@ -125,6 +125,18 @@ function patchSource(source, serializedFallback) {
     changes,
   );
 
+  next = next.replace(
+    /availableModels:new Set\(([A-Za-z_$][\w$]*)\.success\?\1\.data:([A-Za-z_$][\w$]*)\)/g,
+    (whole, parsed, fallback) => {
+      changes.push("allow official GPT-5.6 models in the hidden-model whitelist");
+      return (
+        "availableModels:(e=>{let n=new Set(e);return " +
+        JSON.stringify(GPT56_MODELS) +
+        `.forEach(e=>n.add(e)),n})(${parsed}.success?${parsed}.data:${fallback})`
+      );
+    },
+  );
+
   if (next.includes("supportedReasoningEfforts") && !next.includes("__codexGpt56Merge")) {
     const helper =
       `const __codexGpt56Fallback=${serializedFallback};` +
@@ -151,6 +163,20 @@ function patchSource(source, serializedFallback) {
     (whole, visible, available, model) => {
       changes.push("show GPT-5.6 fallback when hidden-model filtering is enabled");
       return `if(${visible}?${available}.has(${model}.model)||${model}.__codexGpt56Fallback:!${model}.hidden){`;
+    },
+  );
+  next = next.replace(
+    /if\(\(([A-Za-z_$][\w$]*)\?([A-Za-z_$][\w$]*)\.has\(([A-Za-z_$][\w$]*)\.model\):!\3\.hidden\)\|\|String\(\3\.model\)\.toLowerCase\(\)\.startsWith\(`gpt-5\.6`\)\)\{/g,
+    (whole, visible, available, model) => {
+      changes.push("replace legacy wildcard GPT-5.6 model filter");
+      return `if((${visible}?${available}.has(${model}.model):!${model}.hidden)||${JSON.stringify(GPT56_MODELS)}.includes(${model}.model)){`;
+    },
+  );
+  next = next.replace(
+    /if\(([A-Za-z_$][\w$]*)\?([A-Za-z_$][\w$]*)\.has\(([A-Za-z_$][\w$]*)\.model\):!\3\.hidden\)\{/g,
+    (whole, visible, available, model) => {
+      changes.push("allow official GPT-5.6 models through the model filter");
+      return `if((${visible}?${available}.has(${model}.model):!${model}.hidden)||${JSON.stringify(GPT56_MODELS)}.includes(${model}.model)){`;
     },
   );
 
@@ -212,35 +238,6 @@ function patchSource(source, serializedFallback) {
   return { code: next, changes };
 }
 
-function upsertRootToml(lines, key, value) {
-  const tableIndex = lines.findIndex((line) => /^\s*\[/.test(line));
-  const end = tableIndex === -1 ? lines.length : tableIndex;
-  const keyPattern = new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=`);
-  for (let index = 0; index < end; index += 1) {
-    if (keyPattern.test(lines[index])) {
-      lines[index] = `${key} = ${value}`;
-      return;
-    }
-  }
-  lines.splice(end, 0, `${key} = ${value}`);
-}
-
-function updateLocalConfig(catalogPath, check) {
-  const configPath = path.join(os.homedir(), ".codex", "config.toml");
-  const content = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
-  const lines = content === "" ? [] : content.replace(/\r\n/g, "\n").split("\n");
-  if (lines.at(-1) === "") lines.pop();
-  const tomlPath = catalogPath.replace(/'/g, "''");
-  upsertRootToml(lines, "model_catalog_json", `'${tomlPath}'`);
-  upsertRootToml(lines, "model_reasoning_effort", '"xhigh"');
-  upsertRootToml(lines, "service_tier", '"priority"');
-  if (!check) {
-    fs.mkdirSync(path.dirname(configPath), { recursive: true });
-    fs.writeFileSync(configPath, `${lines.join("\n")}\n`, "utf8");
-  }
-  return configPath;
-}
-
 async function main() {
   const args = process.argv.slice(2);
   const check = args.includes("--check");
@@ -250,7 +247,6 @@ async function main() {
 
   const catalogPath = path.join(PROJECT_ROOT, "model-catalog.json");
   if (!check) fs.writeFileSync(catalogPath, `${JSON.stringify(catalog, null, 2)}\n`, "utf8");
-  const configPath = updateLocalConfig(catalogPath, check);
   const serializedFallback = JSON.stringify(fallbackModels(catalog));
   let updated = 0;
   let matched = 0;
@@ -276,7 +272,6 @@ async function main() {
   }
 
   console.log(`  [ok] official catalog: ${catalog.models.length} models -> ${relPath(catalogPath)}`);
-  console.log(`  [ok] local config: ${configPath}`);
   console.log(check ? `  [?] ${matched} WebView file(s) patchable` : `  [ok] ${updated} WebView file(s) updated`);
 }
 
