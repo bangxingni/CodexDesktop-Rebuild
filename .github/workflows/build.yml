@@ -30,6 +30,7 @@ jobs:
       - run: |
           npm ci
       - run: |
+          brew untap aws/tap || true
           brew install --quiet sevenzip
       - run: node scripts/sync-upstream.js --force --skip-win
       - run: node scripts/patch-all.js mac-${{ matrix.arch }}

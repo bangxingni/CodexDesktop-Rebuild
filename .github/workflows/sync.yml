@@ -76,6 +76,7 @@ jobs:
 
       - name: Install tools
         run: |
+          brew untap aws/tap || true
           brew install --quiet sevenzip
 
       - name: Sync upstream (macOS only)
