@@ -3,7 +3,7 @@
  * build-from-upstream.js — Patch upstream Codex and repackage
  *
  * For macOS and Windows: no forge needed.
- * Takes the upstream app, patches ASAR in-place, replaces codex CLI, outputs distributable.
+ * Takes the upstream app, patches ASAR in-place, and outputs a distributable.
  *
  * Usage:
  *   node scripts/build-from-upstream.js --platform mac-arm64
@@ -362,6 +362,13 @@ function updateAsarIntegrity(asarPath, infoPlistPath) {
 // ─── Shared ─────────────────────────────────────────────────────
 
 function replaceCodex(platform, resourcesDir, binName) {
+  // The Windows MSIX already includes the matching current CLI. Replacing it
+  // with the npm package can downgrade model availability (for example 5.6).
+  if (platform === "win") {
+    console.log(`   [codex] keeping upstream Windows CLI`);
+    return;
+  }
+
   const vendor = resolveCodexVendor(platform);
   if (vendor) {
     const dest = path.join(resourcesDir, binName);
