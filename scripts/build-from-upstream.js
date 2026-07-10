@@ -12,7 +12,7 @@
  */
 const fs = require("fs");
 const path = require("path");
-const { execSync } = require("child_process");
+const { execSync, execFileSync } = require("child_process");
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const SRC_DIR = path.join(PROJECT_ROOT, "src");
@@ -49,6 +49,84 @@ function copyRecursive(src, dest) {
   return count;
 }
 
+function commandExists(command) {
+  try {
+    if (process.platform === "win32") {
+      execFileSync("where.exe", [command], { stdio: "ignore" });
+    } else {
+      execFileSync("sh", ["-c", `command -v ${command}`], { stdio: "ignore" });
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function createZipFromDirectory(srcDir, zipPath) {
+  fs.rmSync(zipPath, { force: true });
+
+  const sevenZip = ["7zz", "7z"].find(commandExists);
+  if (sevenZip) {
+    console.log(`   [zip] using ${sevenZip}`);
+    execFileSync(sevenZip, ["a", "-tzip", "-mx=5", zipPath, "."], { cwd: srcDir, stdio: "inherit" });
+    return;
+  }
+
+  if (process.platform === "win32") {
+    const powershell = ["pwsh", "powershell"].find(commandExists);
+    if (powershell) {
+      console.log(`   [zip] using ${powershell}`);
+      const command = [
+        "Add-Type -AssemblyName System.IO.Compression.FileSystem",
+        "if (Test-Path -LiteralPath $args[1]) { Remove-Item -LiteralPath $args[1] -Force }",
+        "[System.IO.Compression.ZipFile]::CreateFromDirectory($args[0], $args[1], [System.IO.Compression.CompressionLevel]::Optimal, $false)",
+      ].join("; ");
+      execFileSync(powershell, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command, srcDir, zipPath], { stdio: "inherit" });
+      return;
+    }
+  }
+
+  throw new Error("No ZIP tool found. Install 7-Zip CLI (7zz or 7z), or run on Windows with PowerShell available.");
+}
+
+function getWindowsExecutableArch(exePath) {
+  const buf = fs.readFileSync(exePath);
+  if (buf.length < 0x40 || buf.toString("ascii", 0, 2) !== "MZ") return "unknown";
+
+  const peOffset = buf.readUInt32LE(0x3c);
+  if (peOffset + 6 > buf.length || buf.toString("ascii", peOffset, peOffset + 4) !== "PE\0\0") return "unknown";
+
+  const machine = buf.readUInt16LE(peOffset + 4);
+  return {
+    0x14c: "x86",
+    0x8664: "x64",
+    0xaa64: "arm64",
+  }[machine] || `unknown-0x${machine.toString(16)}`;
+}
+
+function assertWindowsX64Executable(exePath, label) {
+  const arch = getWindowsExecutableArch(exePath);
+  if (arch !== "x64") {
+    throw new Error(`${label} is ${arch}, expected x64: ${exePath}`);
+  }
+}
+
+function findMacAppBundle(dir) {
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, e.name);
+    if (!e.isDirectory()) continue;
+
+    if (e.name.endsWith(".app")) {
+      const asarPath = path.join(full, "Contents", "Resources", "app.asar");
+      if (fs.existsSync(asarPath)) return full;
+    }
+
+    const found = findMacAppBundle(full);
+    if (found) return found;
+  }
+  return null;
+}
+
 function resolveCodexVendor(platform) {
   const triple = TARGET_TRIPLE_MAP[platform];
   if (!triple) return null;
@@ -79,6 +157,10 @@ function resolveCodexVendor(platform) {
   try {
     baseVer = execSync("npm view @cometix/codex version", { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
   } catch { return null; }
+  if (!baseVer) {
+    console.log(`   [!] @cometix/codex version not found`);
+    return null;
+  }
 
   // e.g. "0.128.0-cometix" → "@cometix/codex@0.128.0-cometix-darwin-x64"
   const platPkgSpec = `@cometix/codex@${baseVer}-${suffix}`;
@@ -116,21 +198,10 @@ function buildMac(platform) {
   const variant = platform === "mac-arm64" ? "arm64" : "x64";
   const extractDir = path.join(tempDir, `${variant}-extract`);
 
-  // Find Codex.app
-  let appPath = null;
-  if (fs.existsSync(extractDir)) {
-    const findApp = (dir) => {
-      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-        if (e.name === "Codex.app" && e.isDirectory()) return path.join(dir, e.name);
-        if (e.isDirectory()) { const r = findApp(path.join(dir, e.name)); if (r) return r; }
-      }
-      return null;
-    };
-    appPath = findApp(extractDir);
-  }
+  const appPath = fs.existsSync(extractDir) ? findMacAppBundle(extractDir) : null;
 
   if (!appPath) {
-    console.error(`[x] Codex.app not found in cache. Run sync-upstream first.`);
+    console.error(`[x] macOS .app bundle with Contents/Resources/app.asar not found in cache. Run sync-upstream first.`);
     process.exit(1);
   }
 
@@ -140,7 +211,7 @@ function buildMac(platform) {
   const outAppDir = path.join(OUT_DIR, platform);
   clearDir(outAppDir);
   const outApp = path.join(outAppDir, "Codex.app");
-  console.log("   [copy] Codex.app -> out/");
+  console.log(`   [copy] ${path.basename(appPath)} -> out/Codex.app`);
   execSync(`ditto "${appPath}" "${outApp}"`);
 
   const resourcesDir = path.join(outApp, "Contents", "Resources");
@@ -210,6 +281,7 @@ function buildWin(platform) {
   const outApp = path.join(outAppDir, "Codex-win32-x64");
   console.log("   [copy] MSIX app/ -> out/");
   copyRecursive(appDir, outApp);
+  assertWindowsX64Executable(path.join(outApp, "Codex.exe"), "Codex.exe");
 
   const resourcesDir = path.join(outApp, "resources");
 
@@ -244,7 +316,7 @@ function buildWin(platform) {
   const zipName = `Codex-win-x64-${version}.zip`;
   const zipPath = path.join(OUT_DIR, zipName);
   console.log(`   [zip] ${zipName}`);
-  execSync(`7zz a -tzip -mx=5 "${zipPath}" .`, { cwd: outApp });
+  createZipFromDirectory(outApp, zipPath);
 
   const sizeMB = (fs.statSync(zipPath).size / 1048576).toFixed(1);
   console.log(`   [ok] ${zipPath} (${sizeMB} MB)`);
