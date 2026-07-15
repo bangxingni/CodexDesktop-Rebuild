@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       has_update: ${{ steps.detect.outputs.has_update }}
+      should_build: ${{ steps.detect.outputs.should_build }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -34,18 +35,44 @@ jobs:
       - name: Check upstream versions
         id: detect
         run: |
-          set +e
-          node scripts/check-update.js --json --force 2>&1
-          exit_code=$?
-          set -e
+          RESULT=$(node scripts/check-update.js --json --force)
+          LATEST_VERSION=$(echo "$RESULT" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{const j=JSON.parse(d);console.log(j.platforms?.['macOS-arm64']?.version||j.platforms?.['macOS-x64']?.version||j.platforms?.Windows?.version||'')})")
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
 
-          if [ "${{ inputs.force }}" = "true" ]; then
-            echo "has_update=true" >> "$GITHUB_OUTPUT"
-          elif [ $exit_code -eq 0 ]; then
-            echo "has_update=true" >> "$GITHUB_OUTPUT"
+          if [ -z "$LATEST_VERSION" ]; then
+            echo "No upstream version detected."
+            exit 1
+          fi
+
+          IS_NEWER=$(node -e "
+            const [latest, current] = process.argv.slice(1);
+            const valid = /^\d+(?:\.\d+)*$/;
+            if (!valid.test(latest) || !valid.test(current)) {
+              console.error('Invalid version:', { latest, current });
+              process.exit(1);
+            }
+            const a = latest.split('.').map(Number);
+            const b = current.split('.').map(Number);
+            const length = Math.max(a.length, b.length);
+            let comparison = 0;
+            for (let i = 0; i < length; i++) {
+              if ((a[i] || 0) !== (b[i] || 0)) {
+                comparison = (a[i] || 0) > (b[i] || 0) ? 1 : -1;
+                break;
+              }
+            }
+            console.log(comparison > 0 ? 'true' : 'false');
+          " "$LATEST_VERSION" "$CURRENT_VERSION")
+
+          echo "Latest upstream version: $LATEST_VERSION"
+          echo "Current repository version: $CURRENT_VERSION"
+          echo "has_update=$IS_NEWER" >> "$GITHUB_OUTPUT"
+
+          if [ "$IS_NEWER" = "true" ] || [ "${{ inputs.force }}" = "true" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
           else
-            echo "has_update=false" >> "$GITHUB_OUTPUT"
-            echo "No upstream update detected."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "No newer upstream version detected."
           fi
 
   # ──────────────────────────────────────────────
@@ -54,7 +81,7 @@ jobs:
   # ──────────────────────────────────────────────
   build-mac:
     needs: check
-    if: needs.check.outputs.has_update == 'true'
+    if: needs.check.outputs.should_build == 'true'
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -97,7 +124,7 @@ jobs:
 
   build-windows:
     needs: check
-    if: needs.check.outputs.has_update == 'true'
+    if: needs.check.outputs.should_build == 'true'
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -142,8 +169,13 @@ jobs:
   # Bump version + tag + release
   # ──────────────────────────────────────────────
   release:
-    needs: [build-mac, build-windows]
-    if: always() && needs.check.result == 'success'
+    needs: [check, build-mac, build-windows]
+    if: >-
+      always() &&
+      needs.check.result == 'success' &&
+      needs.check.outputs.has_update == 'true' &&
+      needs.build-mac.result == 'success' &&
+      needs.build-windows.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -217,6 +249,8 @@ jobs:
             artifacts/**/*.dmg
             artifacts/**/*.zip
             artifacts/**/*.exe
-          draft: true
+          draft: false
+          prerelease: false
+          make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
