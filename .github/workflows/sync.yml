@@ -4,11 +4,6 @@ on:
   schedule:
     - cron: "0 8 * * *" # Daily 08:00 UTC
   workflow_dispatch:
-    inputs:
-      force:
-        description: "Force sync even without version change"
-        type: boolean
-        default: false
 
 env:
   NODE_VERSION: "24"
@@ -68,8 +63,9 @@ jobs:
           echo "Current repository version: $CURRENT_VERSION"
           echo "has_update=$IS_NEWER" >> "$GITHUB_OUTPUT"
 
-          if [ "$IS_NEWER" = "true" ] || [ "${{ inputs.force }}" = "true" ]; then
+          if [ "$IS_NEWER" = "true" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Build requested by update detection or manual workflow run."
           else
             echo "should_build=false" >> "$GITHUB_OUTPUT"
             echo "No newer upstream version detected."
