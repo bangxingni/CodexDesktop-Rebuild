@@ -169,7 +169,7 @@ jobs:
     if: >-
       always() &&
       needs.check.result == 'success' &&
-      needs.check.outputs.has_update == 'true' &&
+      (needs.check.outputs.has_update == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.build-mac.result == 'success' &&
       needs.build-windows.result == 'success'
     runs-on: ubuntu-latest
@@ -198,12 +198,17 @@ jobs:
           WIN_VER=$(echo "$RESULT" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(d);console.log(j.platforms?.Windows?.version||'')}catch{console.log('')}})")
 
           VERSION="${MAC_ARM64:-${MAC_X64:-$WIN_VER}}"
+          if [[ ! "$VERSION" =~ ^[0-9]+([.][0-9]+)*$ ]]; then
+            echo "Invalid or missing upstream version: '$VERSION'"
+            exit 1
+          fi
+
+          TAG="v${VERSION}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "mac_arm64=$MAC_ARM64" >> "$GITHUB_OUTPUT"
           echo "mac_x64=$MAC_X64" >> "$GITHUB_OUTPUT"
           echo "win_version=$WIN_VER" >> "$GITHUB_OUTPUT"
-
-          if [ -z "$VERSION" ]; then echo "No version detected"; exit 0; fi
 
           node -e "
             const fs=require('fs'), p=JSON.parse(fs.readFileSync('package.json','utf8'));
@@ -215,11 +220,19 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git add package.json
-          git diff --cached --quiet && echo "No version change" && exit 0
+          if git diff --cached --quiet; then
+            echo "package.json is already at ${VERSION}"
+          else
+            git commit -m "Bump version to ${VERSION}"
+            git push origin HEAD
+          fi
 
-          git commit -m "Bump version to ${VERSION}"
-          git tag -a "v${VERSION}" -m "Codex ${VERSION}"
-          git push origin HEAD --tags
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists"
+          else
+            git tag -a "$TAG" -m "Codex ${VERSION}"
+            git push origin "$TAG"
+          fi
 
       - name: Download all artifacts
         uses: actions/download-artifact@v7
@@ -229,24 +242,57 @@ jobs:
       - name: Display structure
         run: ls -lhR artifacts/
 
-      - name: Create Release
-        if: steps.version.outputs.version != ''
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: Codex ${{ steps.version.outputs.version }}
-          body: |
-            ## Upstream Versions
-            | Platform | Version |
-            |----------|---------|
-            | macOS arm64 | `${{ steps.version.outputs.mac_arm64 || 'N/A' }}` |
-            | Windows x64 | `${{ steps.version.outputs.win_version || 'N/A' }}` |
-          files: |
-            artifacts/**/*.dmg
-            artifacts/**/*.zip
-            artifacts/**/*.exe
-          draft: false
-          prerelease: false
-          make_latest: true
+      - name: Create or update Release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          MAC_ARM64_VERSION: ${{ steps.version.outputs.mac_arm64 || 'N/A' }}
+          WINDOWS_VERSION: ${{ steps.version.outputs.win_version || 'N/A' }}
+        run: |
+          shopt -s globstar nullglob
+          DMG_FILES=(artifacts/**/*.dmg)
+          ZIP_FILES=(artifacts/**/*.zip)
+
+          if (( ${#DMG_FILES[@]} == 0 || ${#ZIP_FILES[@]} == 0 )); then
+            echo "Expected at least one DMG and one ZIP release artifact"
+            exit 1
+          fi
+
+          ASSETS=("${DMG_FILES[@]}" "${ZIP_FILES[@]}")
+          cat > release-notes.md <<EOF
+          ## Upstream Versions
+          | Platform | Version |
+          |----------|---------|
+          | macOS arm64 | \`${MAC_ARM64_VERSION}\` |
+          | Windows x64 | \`${WINDOWS_VERSION}\` |
+          EOF
+
+          publish_release() {
+            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              gh release edit "$RELEASE_TAG" \
+                --title "Codex ${RELEASE_VERSION}" \
+                --notes-file release-notes.md \
+                --latest &&
+              gh release upload "$RELEASE_TAG" "${ASSETS[@]}" --clobber
+            else
+              gh release create "$RELEASE_TAG" "${ASSETS[@]}" \
+                --verify-tag \
+                --title "Codex ${RELEASE_VERSION}" \
+                --notes-file release-notes.md \
+                --latest
+            fi
+          }
+
+          for attempt in 1 2 3; do
+            echo "Publishing ${RELEASE_TAG} (attempt ${attempt}/3)"
+            if publish_release; then
+              exit 0
+            fi
+            if (( attempt < 3 )); then
+              sleep $((attempt * 15))
+            fi
+          done
+
+          echo "Release publishing failed after 3 attempts"
+          exit 1
