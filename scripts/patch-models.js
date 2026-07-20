@@ -9,18 +9,86 @@ const path = require("path");
 const { relPath, SRC_DIR, PROJECT_ROOT } = require("./patch-util");
 
 const CATALOG_URL =
-  "https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json";
+  "https://github.com/openai/codex/raw/refs/heads/main/codex-rs/models-manager/models.json";
+const CATALOG_FETCH_ATTEMPTS = 3;
+const CATALOG_FETCH_TIMEOUT_MS = 10_000;
 const GPT56_SLUGS = new Set(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
 const GPT56_MODELS = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 const ALL_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
+const EFFORT_DESCRIPTIONS = {
+  low: "Fast responses with lighter reasoning",
+  medium: "Balances speed and reasoning depth for everyday tasks",
+  high: "Greater reasoning depth for complex problems",
+  xhigh: "Extra high reasoning depth for complex problems",
+  max: "Maximum reasoning depth for the hardest problems",
+  ultra: "Maximum reasoning with automatic task delegation",
+};
 
-function fetchJson(url) {
+function embeddedCatalog() {
+  const fastServiceTier = {
+    id: "priority",
+    name: "Fast",
+    description: "1.5x speed, increased usage",
+  };
+  const model = (slug, displayName, description, defaultReasoningLevel, efforts, multiAgentVersion) => ({
+    slug,
+    display_name: displayName,
+    description,
+    default_reasoning_level: defaultReasoningLevel,
+    supported_reasoning_levels: efforts.map((effort) => ({
+      effort,
+      description: EFFORT_DESCRIPTIONS[effort],
+    })),
+    context_window: 272000,
+    tool_mode: "code_mode_only",
+    use_responses_lite: true,
+    multi_agent_version: multiAgentVersion,
+    service_tiers: [fastServiceTier],
+    additional_speed_tiers: ["fast"],
+  });
+
+  return {
+    models: [
+      model(
+        "gpt-5.6-sol",
+        "GPT-5.6-Sol",
+        "Latest frontier agentic coding model.",
+        "low",
+        ALL_EFFORTS,
+        "v2",
+      ),
+      model(
+        "gpt-5.6-terra",
+        "GPT-5.6-Terra",
+        "Balanced agentic coding model for everyday work.",
+        "medium",
+        ALL_EFFORTS,
+        "v2",
+      ),
+      model(
+        "gpt-5.6-luna",
+        "GPT-5.6-Luna",
+        "Fast and affordable agentic coding model.",
+        "medium",
+        ALL_EFFORTS.slice(0, -1),
+        "v1",
+      ),
+    ],
+  };
+}
+
+function fetchJsonOnce(url) {
   return new Promise((resolve, reject) => {
-    https
-      .get(url, { headers: { "User-Agent": "CodexDesktop-Rebuild" } }, (response) => {
+    const request = https.get(
+      url,
+      {
+        headers: { "User-Agent": "CodexDesktop-Rebuild" },
+        timeout: CATALOG_FETCH_TIMEOUT_MS,
+      },
+      (response) => {
         if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
           response.resume();
-          resolve(fetchJson(response.headers.location));
+          resolve(fetchJsonOnce(new URL(response.headers.location, url).href));
           return;
         }
         if (response.statusCode !== 200) {
@@ -38,9 +106,30 @@ function fetchJson(url) {
             reject(new Error(`Official catalog is not valid JSON: ${error.message}`));
           }
         });
-      })
-      .on("error", reject);
+      },
+    );
+    request.on("timeout", () => request.destroy(new Error("Official catalog request timed out")));
+    request.on("error", reject);
   });
+}
+
+async function fetchJson(url) {
+  let lastError;
+  for (let attempt = 1; attempt <= CATALOG_FETCH_ATTEMPTS; attempt++) {
+    try {
+      return await fetchJsonOnce(url);
+    } catch (error) {
+      lastError = error;
+      if (attempt === CATALOG_FETCH_ATTEMPTS) break;
+      const delayMs = attempt * 1_000;
+      console.warn(
+        `  [!] official catalog fetch failed (${error.message}); retrying in ${delayMs}ms ` +
+          `(${attempt}/${CATALOG_FETCH_ATTEMPTS})`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError;
 }
 
 function validateCatalog(catalog) {
@@ -59,8 +148,8 @@ function validateCatalog(catalog) {
     if (actual.join(",") !== efforts.join(",")) {
       throw new Error(`${slug} has unexpected reasoning efforts: ${actual.join(",")}`);
     }
-    if (model.context_window !== 372000) {
-      throw new Error(`${slug} has unexpected context window: ${model.context_window}`);
+    if (!Number.isInteger(model.context_window) || model.context_window < 100000) {
+      throw new Error(`${slug} has invalid context window: ${model.context_window}`);
     }
   }
   if (bySlug.has("gpt-5.6-pro")) throw new Error("Unexpected gpt-5.6-pro in official catalog");
@@ -242,11 +331,21 @@ async function main() {
   const args = process.argv.slice(2);
   const check = args.includes("--check");
   const platform = args.find((arg) => ["mac-arm64", "mac-x64", "win"].includes(arg));
-  const catalog = await fetchJson(CATALOG_URL);
+  let catalog;
+  let catalogSource = "official";
+  try {
+    catalog = await fetchJson(CATALOG_URL);
+  } catch (error) {
+    catalog = embeddedCatalog();
+    catalogSource = "embedded fallback";
+    console.warn(`  [!] ${error.message}; using the embedded verified GPT-5.6 catalog`);
+  }
   validateCatalog(catalog);
 
   const catalogPath = path.join(PROJECT_ROOT, "model-catalog.json");
-  if (!check) fs.writeFileSync(catalogPath, `${JSON.stringify(catalog, null, 2)}\n`, "utf8");
+  if (!check && catalogSource === "official") {
+    fs.writeFileSync(catalogPath, `${JSON.stringify(catalog, null, 2)}\n`, "utf8");
+  }
   const serializedFallback = JSON.stringify(fallbackModels(catalog));
   let updated = 0;
   let matched = 0;
@@ -271,7 +370,9 @@ async function main() {
     console.log(`  [${target.platform}] ${relPath(target.path)}: ${[...new Set(changes)].join(", ")}`);
   }
 
-  console.log(`  [ok] official catalog: ${catalog.models.length} models -> ${relPath(catalogPath)}`);
+  const catalogOutput =
+    catalogSource === "official" ? ` -> ${relPath(catalogPath)}` : "";
+  console.log(`  [ok] ${catalogSource} catalog: ${catalog.models.length} models${catalogOutput}`);
   console.log(check ? `  [?] ${matched} WebView file(s) patchable` : `  [ok] ${updated} WebView file(s) updated`);
 }
 

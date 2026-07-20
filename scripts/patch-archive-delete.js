@@ -15,6 +15,22 @@ const fs = require("fs");
 const acorn = require("acorn");
 const { locateBundles, relPath } = require("./patch-util");
 
+function hasNativeArchiveDeleteRoutes(code) {
+  return (
+    code.includes("delete-archived-conversation") &&
+    code.includes("delete-all-archived-conversations") &&
+    code.includes(".deleteArchivedConversation(")
+  );
+}
+
+function hasNativeArchiveDeleteUi(code) {
+  return (
+    code.includes("delete-archived-conversation") &&
+    code.includes("settings.dataControls.archivedChats.deleteConfirm.title") &&
+    code.includes("settings.dataControls.archivedChats.deleteAriaLabel")
+  );
+}
+
 // ─── Layer 1: app-main route injection ──────────────────────────
 
 function patchAppMain(bundles) {
@@ -24,6 +40,11 @@ function patchAppMain(bundles) {
 
     if (code.includes("delete-conversation")) {
       console.log(`  [ok] ${relPath(bundle.path)}: route already patched`);
+      continue;
+    }
+
+    if (hasNativeArchiveDeleteRoutes(code)) {
+      console.log(`  [ok] ${relPath(bundle.path)}: native archive-delete routes available`);
       continue;
     }
 
@@ -63,6 +84,11 @@ function patchDataControls(bundles) {
 
     if (code.includes("delete-conversation")) {
       console.log(`  [ok] ${relPath(bundle.path)}: delete button already patched`);
+      continue;
+    }
+
+    if (hasNativeArchiveDeleteUi(code)) {
+      console.log(`  [ok] ${relPath(bundle.path)}: native archive-delete UI available`);
       continue;
     }
 
